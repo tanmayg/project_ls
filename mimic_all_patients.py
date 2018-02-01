@@ -6,7 +6,8 @@ Created on Sat Dec  2 19:24:21 2017
 """
 import pandas as pd
 import numpy as np
-from data_profile import execute_sql
+from data_profile import execute_sql, write_to_table
+import NDC_Mapping_v4
 
 #%% create master diagnosis frame
 def master_icd9():
@@ -111,7 +112,7 @@ def diagnosis_summary(diag_data, comorbidity, MASTER_icd9):
                 return(pd.DataFrame(delta.dt.days))
     inpat_cera['days_btwn_cond'] = inpat_cera.groupby(['subject_id','visit_year']).apply(cal_days_btwn_cond)
     #dataframe to be used further for calculating mtbe
-    inpat_mtbe = inpat_cera
+    inpat_mtbe = inpat_cera.copy()
     #condition era with persistence window of 30 days
     inpat_cera['cera_30'] = inpat_cera['days_btwn_cond'].apply(lambda x: 0 if x <= 30 else 1)
     inpat_cera['cera_60'] = inpat_cera['days_btwn_cond'].apply(lambda x: 0 if x <= 60 else 1)
@@ -131,10 +132,27 @@ def diagnosis_summary(diag_data, comorbidity, MASTER_icd9):
     #Merging all computed datasets
     inpat_diag_summary = inpat_first_date.merge(inpat_diag_08,on='subject_id',how='outer').merge(inpat_diag_09,on='subject_id',how='outer').merge(inpat_diag_10,on='subject_id',how='outer').merge(inpat_cera,on='subject_id',how='outer').merge(inpat_mtbe,on='subject_id',how='outer')
     return(inpat_diag_summary)
+
+#%% configuring the icd9 codes for matching (253.1->253.10, 493->493.00)
+def configure_icd9_codes(df, col, new_col):
+    df[col] = df[col].apply(str)
+    df[new_col] = df[col]
+    for i, row in df.iterrows():
+        if '.' in row[new_col]:
+            str_pre_decimal = row[new_col].split('.')[0]
+            str_post_decimal = row[new_col].split('.')[1]
+            if len(str_post_decimal) == 1:
+                str_post_decimal = str_post_decimal + '0'
+                df.loc[i, new_col] = str_pre_decimal + '.' + str_post_decimal
+        else:
+            df.loc[i, new_col] = row[new_col] + '.00'
+    return(df)
     
 #%% Function to create drug summaries
-def drug_summary(pres_data, pres_name, adm_data):
-    print("\nDrug summary:",pres_name)
+def drug_summary(pres_data, pres_name, adm_data, hcup_df):
+    print("\n###########################################################")
+    print("#    Drug summary:",pres_name)
+    print("###########################################################")
     drug_era = pres_data[['subject_id', 'hadm_id', 'starttime', 'endtime', 'ndc', 'drug', 'dose_val_rx', 'dose_unit_rx', 'drug_type']]
     drug_era.columns = ['subject_id','hadm_id','drug_strt_orig','drug_end_orig','ndc','drug','dose_val_rx', 'dose_unit_rx', 'drug_type']
     drug_era = drug_era.dropna(subset=['drug_strt_orig','drug_end_orig'])
@@ -180,6 +198,49 @@ def drug_summary(pres_data, pres_name, adm_data):
     colnames = ["_".join((j,i)) for i,j in inpat_dera.columns[1:]]
     inpat_dera.columns = ['subject_id'] + colnames
     inpat_dera = pd.merge(inpat_drug_count, inpat_dera, on='subject_id')
+    
+    #find may treat & may prevent diagnosis
+    may_df_final = NDC_Mapping_v4.main(pres_data)
+    may_df_final = may_df_final.drop_duplicates()
+    
+    #configure icd9 code for the match
+    may_df_final = configure_icd9_codes(may_df_final, 'may_icd9', 'icd9_to_compare')
+    
+    #add hcup levels to the may_df_final data frame
+    may_df_final = pd.merge(may_df_final, hcup_df[['icd9_to_compare', 'hcup_label']], how='left', on='icd9_to_compare')
+    
+    #exrtact the one's with no match & implement the following logic:
+    #1) If the Diagnoses code can not be found and is 3 digits:
+    #a) add "No HCUP mapping found - changed code to xxx00 (where xxx is the original code) to the output table for reference
+    #b) append a trailing 00  (2 zeros) to the end of the 3 digit code, and look for this code as before,  If found continue mapping as defined
+    #
+    #2) If updated code (with 00 appended) is not found:
+    #a) Increment (00) to (01) and search for code. Update message defined in step 1a to reflect the change in the last 2 digits. If found, continue mapping as defined.  
+    #b) If (01) not found, increment (01) to (02) and continue search and mapping
+    #c) continue steps a and b above until a match is found.
+
+    may_df_final_na = may_df_final[may_df_final['hcup_label'].isnull()]
+    if len(may_df_final_na) > 0:
+        for i, row in may_df_final_na.iterrows():
+            if ('.' not in row['may_icd9']) & (row['may_icd9'].str.len==3):
+                 for i in range(100):
+                     row['icd9_to_compare'] = row['may_icd9'] + '.' + str(i).zfill(2)
+                     hcup_temp = hcup_df.loc[hcup_df['icd9_to_compare']==row['icd9_to_compare'],]
+                     if len(hcup_temp)>0:
+                         may_df_final_na[i, 'hcup_label'] = hcup_temp['hcup_label']
+                         break
+    
+        # merge with the main may_df_final
+        may_df_final_na = may_df_final_na.dropna(subset=['hcup_label'])
+        may_df_final = pd.concat([may_df_final, may_df_final_na], ignore_index=True)
+    
+    #match with each patient's ndc
+    may_df_subject = pd.merge(pres_data[['subject_id', 'ndc']].drop_duplicates(), may_df_final, on='ndc')
+    may_df_subject = pd.pivot_table(may_df_subject, values='ndc', index='subject_id', columns='hcup_label',aggfunc=np.size,fill_value=0).reset_index()
+    colnames = list(pres_name + '_may_tp_' + may_df_subject.columns[1:].astype(str))
+    may_df_subject.columns = may_df_subject.columns[:1].tolist() + colnames
+    #merge with the drug era frame
+    inpat_dera = pd.merge(inpat_dera, may_df_subject, on='subject_id', how = 'left')
     return(inpat_dera)
 
 #%% feature creation from raw data
@@ -297,18 +358,6 @@ def feature_creation(admission, diagnosis, procedures, MASTER_icd9):
     proc_final = proc_final.reset_index()
     #### meging with inpatient set above
     inpat_final = pd.merge(inpat_final,proc_final, on='subject_id', how='left')
-    
-    # Drugs processing (added on 01/08/2018)
-    pres = execute_sql("select * from mimic_prescriptions where drug_type='MAIN'")
-    pres_unique = pres[['drug']].drop_duplicates()
-    inpat_pres = pd.DataFrame(columns=['subject_id'])
-    for i, row in pres_unique.iterrows():
-        pres_data = pres.loc[pres.drug == row.drug,]
-        adm_data = admission.loc[admission.hadm_id.isin(pres_data.hadm_id),]
-        inpat_pres_temp = drug_summary(pres_data, row.drug, adm_data)
-        inpat_pres = inpat_pres.merge(inpat_pres_temp,on='subject_id',how='outer')
-    #### meging with inpatient set above
-    inpat_final = pd.merge(inpat_final, inpat_pres, on='subject_id', how='left')
     return(inpat_final)
 
 #%% derived features based on features summary
@@ -474,7 +523,84 @@ def derived_summary_features(inpat_final):
     inpat_final['CNCR_LUNG_Count_2008_2010'] = inpat_final[["CNCR_LUNG_Count_2008","CNCR_LUNG_Count_2009","CNCR_LUNG_Count_2010"]].sum(axis=1)
     inpat_final['CNCR_LUNG_Prc_2008_2010'] = inpat_final.CNCR_LUNG_Count_2008_2010/inpat_final.Total_Comorb_14
     return(inpat_final)
+    
+#%% add labels to the columns required (note: for diagnosis it adds ccs label)
+def labels_for_neighbor_features(df, col):
+    idx_list = []
+    ndc_list = []
+    lab_list = []
+    for i, row in df.iterrows():
+        if row[col].split('_')[0] == 'IDX':
+            idx_list.append(row[col])
+        elif row[col].split('_')[0] == 'N':
+            ndc_list.append(row[col])
+        elif row[col].split('_')[0] == 'L':
+            lab_list.append(row[col])
+    
+    # intialize empty dataframes
+    idx_df = pd.DataFrame()
+    ndc_df = pd.DataFrame()
+    lab_df = pd.DataFrame()
+    
+    if len(idx_list) > 0:
+        # get labels for diagnosis(IDX)
+        idx_list = pd.DataFrame(idx_list, columns=['code_id'])
+        idx_list['code'] = idx_list['code_id'].str.split('_').str[1]
+        idx_list = idx_list.drop_duplicates()
+        idx_df = pd.merge(idx_list, hcup_df[['icd9_std', 'hcup_label']], how='left', left_on='code', right_on='icd9_std')
+        idx_df = idx_df.drop('icd9_std', 1)
+        idx_df.columns = ['code_id', 'code', 'label']
+    if len(ndc_list) > 0:
+        # get labels for drugs(NDC)
+        ndc_list = pd.DataFrame(ndc_list, columns=['code_id'])
+        ndc_list['code'] = ndc_list['code_id'].str.split('_').str[1]
+        ndc_list = ndc_list.drop_duplicates()
+        ndc_sql_list = str(list(ndc_list.code)).strip('[]')
+        ndc_db = execute_sql("select ndc as code, pref_label as label from d_ndc_codes where ndc in (%s)" %(ndc_sql_list))
+        ndc_df = pd.merge(ndc_list, ndc_db, how='left', on='code')
+    if len(lab_list) > 0:
+        # get labels for labs(LAB)
+        lab_list = pd.DataFrame(lab_list, columns=['code_id'])
+        lab_list['code'] = lab_list['code_id'].str.split('_').str[1]
+        lab_list = lab_list.drop_duplicates()
+        lab_sql_list = str(list(lab_list.code)).strip('[]')
+        lab_db = execute_sql("select loinc_code as code, loinc_label as label from d_loinc_codes where loinc_code in (%s)" %(lab_sql_list))
+        lab_db = lab_db.drop_duplicates(subset='code')
+        lab_df = pd.merge(lab_list, lab_db, how='left', on='code')
+    
+    #append all list to get the label list
+    label_df = pd.concat([idx_df, ndc_df, lab_df])
+    label_df = label_df.drop('code',1)
+    label_df.columns = [col, col+'_label']
+    # merge with original dataset
+    df = pd.merge(df, label_df, how='left', on=col)
+    return(df)
 
+
+#%% Neighbor Features Creation
+def neighbor_features(patient_id=None):
+    if patient_id:
+        patient_id = str(patient_id).strip('[]')
+        dashbd = execute_sql("select patient_id, pair_l1, pair_l2, neighbor_code, neighbor_pref_name, score from dashbd_final where patient_id in (%s)" %(patient_id))
+    else:
+        dashbd = execute_sql("select select patient_id, pair_l1, pair_l2, neighbor_code, neighbor_pref_name, score from dashbd_final")
+    dashbd = dashbd.drop(['top_n'], axis=1)
+    dashbd = dashbd.drop_duplicates()
+    # extract top 50 for every patient
+    dashbd = dashbd.sort_values(['score'], ascending=False)
+    dashbd = dashbd.groupby('patient_id').apply(lambda x: x.head(50)).reset_index(drop=True)
+    # add labels for columns required    
+    dashbd = labels_for_neighbor_features(dashbd, 'pair_l1')
+    dashbd = labels_for_neighbor_features(dashbd, 'pair_l2')
+    # add new column as neighbor feature
+    dashbd['feature'] = dashbd['pair_l1_label'] + '_' + dashbd['pair_l2_label'] + '_' +  dashbd['neighbor_pref_name']
+    dashbd['feature'] = dashbd['feature'].fillna('NOTFOUND')
+    #pivot data to get data at patient level
+    dashbd_nf = pd.pivot_table(dashbd, values='score', index='patient_id', columns='feature', aggfunc='last', fill_value=0).reset_index()
+    # rename column as hcup_label
+    dashbd_nf.rename(columns={'patient_id':'subject_id'}, inplace=True)
+    return(dashbd_nf)
+    
 #%%# main function
 if __name__ == "__main__":
     print("\nExtracting the admissions, diagnoses & procedures dataset...")
@@ -485,7 +611,7 @@ if __name__ == "__main__":
     # add visit_year column
     admission['visit_year'] = admission['admittime'].dt.year
     # diagnosis dataset
-    diagnosis = execute_sql("select a.*, b.long_title, b.icd9_std from mimic_diagnoses a, mimic_d_icd_diagnoses b where a.icd9_code = b.icd9_code")
+    diagnosis = execute_sql("select a.*, b.long_title, b.icd9_std from mimic_diagnoses a, d_icd9_diagnoses b where a.icd9_code = b.icd9_code")
     # procedures dataset
     procedures = execute_sql('select a.*, b.long_title from mimic_procedures a, mimic_d_icd_procedures b where a.icd9_procedure = b.icd9_procedure')
     # master_icd9
@@ -494,6 +620,34 @@ if __name__ == "__main__":
     inpat_features = feature_creation(admission, diagnosis, procedures, MASTER_icd9)
     #calculating & adding summarised features
     mimic_summary = derived_summary_features(inpat_features)
+    # hcup dataset and processing
+    hcup = execute_sql('select icd9_code, long_title, icd9_std, ccs_lvl_1_label, ccs_lvl_2_label, ccs_lvl_3_label, ccs_lvl_4_label from d_icd9_diagnoses') #(01/24/18) icd9code '388' was present in mimic_d_icd_diagnoses & not in d_icd9_diagnoses
+    hcup_melt = pd.melt(hcup, id_vars=['icd9_code', 'long_title', 'icd9_std'], var_name='col_name')
+    hcup_melt = hcup_melt.loc[hcup_melt['value']!=' ',]
+    hcup_melt['level_id'] = hcup_melt['col_name'].str.split('_').str[2]
+    hcup_melt = hcup_melt.sort_values(['icd9_code','icd9_std','level_id'], ascending=[True,True,False])
+    hcup_df = hcup_melt.groupby(by=['icd9_code', 'icd9_std']).apply(lambda g: g[g['level_id'] == g['level_id'].max()]).reset_index(drop=True)
+    hcup_df = hcup_df.drop(['level_id', 'col_name'],1)
+    # rename column as hcup_label
+    hcup_df.rename(columns={'value':'hcup_label'}, inplace=True)
+    #configure icd9 code for the match
+    hcup_df = configure_icd9_codes(hcup_df, 'icd9_std', 'icd9_to_compare')
+    
+    #the new drug features (added on 01/08/2018)
+    pres = execute_sql("select * from mimic_prescriptions where drug_type='MAIN' and ndc<>'0'")
+    pres_unique = pres[['drug']].drop_duplicates()
+    inpat_pres = pd.DataFrame(columns=['subject_id'])
+    for i, row in pres_unique[:10].iterrows():
+        pres_data = pres.loc[pres.drug == row.drug,]
+        adm_data = admission.loc[admission.hadm_id.isin(pres_data.hadm_id),]
+        inpat_pres_temp = drug_summary(pres_data, row.drug, adm_data, hcup_df)
+        inpat_pres = inpat_pres.merge(inpat_pres_temp,on='subject_id',how='outer')
+    #### meging with summary dataset above
+    mimic_summary = pd.merge(mimic_summary, inpat_pres, on='subject_id', how='left')
+    # the new neighbor feature, for specific patients add list, else leave empty
+    mimic_neighbor = neighbor_features()
+    # merging with the summary
+    mimic_summary = pd.merge(mimic_summary, mimic_neighbor, on='subject_id', how='left')
     #write output to a spreadsheet
     print("\nGenerating the spreadsheet - mimic_all_patients.xlsx")
     writer = pd.ExcelWriter("mimic_all_patients.xlsx", engine='xlsxwriter')
